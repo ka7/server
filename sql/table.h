@@ -1308,7 +1308,7 @@ public:
 
   void init(THD *thd, TABLE_LIST *tl);
   bool fill_item_list(List<Item> *item_list) const;
-  void reset_item_list(List<Item> *item_list) const;
+  void reset_item_list(List<Item> *item_list, uint skip) const;
   void clear_column_bitmaps(void);
   void prepare_for_position(void);
   void mark_columns_used_by_index_no_reset(uint index, MY_BITMAP *map);
@@ -1649,7 +1649,7 @@ class IS_table_read_plan;
 /** The threshold size a blob field buffer before it is freed */
 #define MAX_TDC_BLOB_SIZE 65536
 
-class select_union;
+class select_unit;
 class TMP_TABLE_PARAM;
 
 Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
@@ -1882,7 +1882,7 @@ struct TABLE_LIST
     select_result for derived table to pass it from table creation to table
     filling procedure
   */
-  select_union  *derived_result;
+  select_unit  *derived_result;
   /* Stub used for materialized derived tables. */
   table_map	map;                    /* ID bit of table (1,2,4,8,16...) */
   table_map get_map()
