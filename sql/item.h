@@ -1543,6 +1543,8 @@ public:
   virtual void mark_as_condition_AND_part(TABLE_LIST *embedding) {};
 };
 
+typedef Item (*Item_ptr);
+
 
 /**
   Compare two Items for List<Item>::add_unique()
