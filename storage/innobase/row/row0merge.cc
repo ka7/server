@@ -3993,8 +3993,10 @@ row_merge_build_indexes(
 	}
 
 	/* Get crypt data from tablespace if present. */
-	crypt_data = fil_space_get_crypt_data(new_table->space);
+	fil_space_t* space = fil_space_acquire(new_table->space);
+	crypt_data = fil_space_get_crypt_data(space);
 	crypt_block = NULL;
+	fil_space_release(space);
 
 	/* If tablespace is encrypted, allocate additional buffer for
 	encryption/decryption. */

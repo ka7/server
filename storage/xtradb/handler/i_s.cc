@@ -8514,6 +8514,15 @@ static ST_FIELD_INFO	innodb_tablespaces_encryption_fields_info[] =
 	 STRUCT_FLD(old_name,		""),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
+#define TABLESPACES_ENCRYPTION_ROTATING_OR_FLUSHING 9
+	{STRUCT_FLD(field_name,		"ROTATING_OR_FLUSHING"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		""),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
 	END_OF_ST_FIELD_INFO
 };
 
@@ -8538,7 +8547,8 @@ i_s_dict_fill_tablespaces_encryption(
 
 	fields = table_to_fill->field;
 
-	fil_space_crypt_get_status(space, &status);
+	int found = fil_space_crypt_get_status(space, &status);
+
 	OK(fields[TABLESPACES_ENCRYPTION_SPACE]->store(space));
 
 	OK(field_store_string(fields[TABLESPACES_ENCRYPTION_NAME],
@@ -8554,6 +8564,8 @@ i_s_dict_fill_tablespaces_encryption(
 		   status.current_key_version));
 	OK(fields[TABLESPACES_ENCRYPTION_CURRENT_KEY_ID]->store(
 		   status.key_id));
+	OK(fields[TABLESPACES_ENCRYPTION_ROTATING_OR_FLUSHING]->store(
+			(status.rotating || status.flushing) ? 1 : 0));
 	if (status.rotating) {
 		fields[TABLESPACES_ENCRYPTION_KEY_ROTATION_PAGE_NUMBER]->set_notnull();
 		OK(fields[TABLESPACES_ENCRYPTION_KEY_ROTATION_PAGE_NUMBER]->store(
@@ -8821,7 +8833,8 @@ i_s_dict_fill_tablespaces_scrubbing(
 
 	fields = table_to_fill->field;
 
-	fil_space_get_scrub_status(space, &status);
+	int found = fil_space_get_scrub_status(space, &status);
+
 	OK(fields[TABLESPACES_SCRUBBING_SPACE]->store(space));
 
 	OK(field_store_string(fields[TABLESPACES_SCRUBBING_NAME],
