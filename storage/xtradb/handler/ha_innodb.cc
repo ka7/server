@@ -284,7 +284,7 @@ static TYPELIB innodb_stats_method_typelib = {
 
 /** Possible values for system variables "innodb_checksum_algorithm" and
 "innodb_log_checksum_algorithm". */
-static const char* innodb_checksum_algorithm_names[] = {
+const char* innodb_checksum_algorithm_names[] = {
 	"CRC32",
 	"STRICT_CRC32",
 	"INNODB",
@@ -296,7 +296,7 @@ static const char* innodb_checksum_algorithm_names[] = {
 
 /** Used to define an enumerate type of the system variables
 innodb_checksum_algorithm and innodb_log_checksum_algorithm. */
-static TYPELIB innodb_checksum_algorithm_typelib = {
+TYPELIB innodb_checksum_algorithm_typelib = {
 	array_elements(innodb_checksum_algorithm_names) - 1,
 	"innodb_checksum_algorithm_typelib",
 	innodb_checksum_algorithm_names,
@@ -2073,7 +2073,7 @@ thd_flush_log_at_trx_commit(
 /*================================*/
 	void*	thd)
 {
-	return(THDVAR((THD*) thd, flush_log_at_trx_commit));
+	return(IS_XTRABACKUP() ? 0 : THDVAR((THD*)thd, flush_log_at_trx_commit));
 }
 
 /********************************************************************//**
@@ -3040,7 +3040,7 @@ trx_is_started(
 /****************************************************************//**
 Update log_checksum_algorithm_ptr with a pointer to the function corresponding
 to a given checksum algorithm. */
-static
+
 void
 innodb_log_checksum_func_update(
 /*============================*/
@@ -22013,22 +22013,27 @@ ib_logf(
 	str = static_cast<char*>(malloc(BUFSIZ));
 	my_vsnprintf(str, BUFSIZ, format, args);
 #endif /* __WIN__ */
-
-	switch(level) {
-	case IB_LOG_LEVEL_INFO:
-		sql_print_information("InnoDB: %s", str);
-		break;
-	case IB_LOG_LEVEL_WARN:
-		sql_print_warning("InnoDB: %s", str);
-		break;
-	case IB_LOG_LEVEL_ERROR:
-		sql_print_error("InnoDB: %s", str);
-		sd_notifyf(0, "STATUS=InnoDB: Error: %s", str);
-		break;
-	case IB_LOG_LEVEL_FATAL:
-		sql_print_error("InnoDB: %s", str);
-		sd_notifyf(0, "STATUS=InnoDB: Fatal: %s", str);
-		break;
+	if (!IS_XTRABACKUP()) {
+		switch (level) {
+		case IB_LOG_LEVEL_INFO:
+			sql_print_information("InnoDB: %s", str);
+			break;
+		case IB_LOG_LEVEL_WARN:
+			sql_print_warning("InnoDB: %s", str);
+			break;
+		case IB_LOG_LEVEL_ERROR:
+			sql_print_error("InnoDB: %s", str);
+			sd_notifyf(0, "STATUS=InnoDB: Error: %s", str);
+			break;
+		case IB_LOG_LEVEL_FATAL:
+			sql_print_error("InnoDB: %s", str);
+			sd_notifyf(0, "STATUS=InnoDB: Fatal: %s", str);
+			break;
+		}
+	}
+	else {
+		/* Don't use server logger for XtraBackup, just print to stderr. */
+		fprintf(stderr, "InnoDB: %s\n", str);
 	}
 
 	va_end(args);

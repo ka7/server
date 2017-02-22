@@ -130,7 +130,7 @@ UNIV_INTERN os_ib_mutex_t	os_file_seek_mutexes[OS_FILE_N_SEEK_MUTEXES];
 #define OS_AIO_MERGE_N_CONSECUTIVE	64
 
 #ifdef WITH_INNODB_DISALLOW_WRITES
-#define WAIT_ALLOW_WRITES() os_event_wait(srv_allow_writes_event)
+#define WAIT_ALLOW_WRITES() if (!IS_XTRABACKUP()) os_event_wait(srv_allow_writes_event)
 #else
 #define WAIT_ALLOW_WRITES() do { } while (0)
 #endif /* WITH_INNODB_DISALLOW_WRITES */
@@ -1014,7 +1014,6 @@ os_file_lock(
 #ifndef UNIV_HOTBACKUP
 /****************************************************************//**
 Creates the seek mutexes used in positioned reads and writes. */
-static
 void
 os_io_init_simple(void)
 /*===================*/
@@ -1688,6 +1687,10 @@ os_file_create_simple_no_error_handling_func(
 		return((os_file_t) -1);
 	}
 
+	if (IS_XTRABACKUP()) {
+		share_mode |= FILE_SHARE_DELETE | FILE_SHARE_WRITE;
+	}
+
 	file = CreateFile((LPCTSTR) name,
 			  access,
 			  share_mode,
@@ -1965,7 +1968,10 @@ os_file_create_func(
 
 	create_mode &= ~OS_FILE_ON_ERROR_NO_EXIT;
 	create_mode &= ~OS_FILE_ON_ERROR_SILENT;
-
+	if (srv_backup_mode){
+		/* Permit others to write, while I'm reading. */
+		share_mode |= FILE_SHARE_WRITE;
+	}
 	if (create_mode == OS_FILE_OPEN_RAW) {
 
 		ut_a(!srv_read_only_mode);
@@ -2035,7 +2041,7 @@ os_file_create_func(
 #ifdef UNIV_NON_BUFFERED_IO
 	// TODO: Create a bug, this looks wrong. The flush log
 	// parameter is dynamic.
-	if (type == OS_LOG_FILE && thd_flush_log_at_trx_commit(NULL) == 2) {
+	if (type == OS_LOG_FILE && !IS_XTRABACKUP() && thd_flush_log_at_trx_commit(NULL) == 2) {
 
 		/* Do not use unbuffered i/o for the log files because
 		value 2 denotes that we do not flush the log at every
@@ -3652,7 +3658,7 @@ os_file_get_status(
 			fh = CreateFile(
 				(LPCTSTR) path,		// File to open
 				access,
-				0,			// No sharing
+				FILE_SHARE_READ|FILE_SHARE_WRITE,
 				NULL,			// Default security
 				OPEN_EXISTING,		// Existing file only
 				FILE_ATTRIBUTE_NORMAL,	// Normal file

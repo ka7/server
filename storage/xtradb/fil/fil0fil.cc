@@ -67,6 +67,7 @@ static ulint srv_data_read, srv_data_written;
 #include <fcntl.h>
 #endif
 #include "row0mysql.h"
+#include "trx0purge.h"
 
 MYSQL_PLUGIN_IMPORT extern my_bool lower_case_file_system;
 
@@ -381,7 +382,6 @@ fil_node_get_space_id(
 
 /*******************************************************************//**
 Returns the table space by a given name, NULL if not found. */
-UNIV_INLINE
 fil_space_t*
 fil_space_get_by_name(
 /*==================*/
@@ -1520,12 +1520,13 @@ fil_space_create(
 
 		if (!fil_system->space_id_reuse_warned) {
 			fil_system->space_id_reuse_warned = TRUE;
-
-			ib_logf(IB_LOG_LEVEL_WARN,
-				"Allocated tablespace %lu, old maximum "
-				"was %lu",
-				(ulong) id,
-				(ulong) fil_system->max_assigned_id);
+			if (!IS_XTRABACKUP()) {
+				ib_logf(IB_LOG_LEVEL_WARN,
+					"Allocated tablespace %lu, old maximum "
+					"was %lu",
+					(ulong)id,
+					(ulong)fil_system->max_assigned_id);
+			}
 		}
 
 		fil_system->max_assigned_id = id;
@@ -2342,6 +2343,19 @@ fil_read_first_page(
 	const char*	check_msg = NULL;
 	fil_space_crypt_t* cdata;
 
+	if (IS_XTRABACKUP() && srv_backup_mode) {
+		/* Files smaller than page size may occur
+		in xtrabackup, when server creates new file
+		but has not yet written into it, or wrote only
+		partially. Checks size here, to avoid exit in os_file_read.
+		This file will be skipped by xtrabackup if it is too small.
+		*/
+		os_offset_t	file_size;
+		file_size = os_file_get_size(data_file);
+		if (file_size < UNIV_PAGE_SIZE) {
+			return "File is smaller than UNIV_PAGE_SIZE";
+		}
+	}
 
 	buf = static_cast<byte*>(ut_malloc(2 * UNIV_PAGE_SIZE));
 
@@ -2373,7 +2387,9 @@ fil_read_first_page(
 			}
 		}
 
-		check_msg = fil_check_first_page(page, *space_id, *flags);
+        if (!(IS_XTRABACKUP() && srv_backup_mode)) {
+		  check_msg = fil_check_first_page(page, *space_id, *flags);
+		}
 	}
 
 	flushed_lsn = mach_read_from_8(page +
@@ -3124,7 +3140,7 @@ fil_delete_tablespace(
 		err = DB_IO_ERROR;
 	}
 
-	if (err == DB_SUCCESS) {
+	if (err == DB_SUCCESS && !IS_XTRABACKUP()) {
 #ifndef UNIV_HOTBACKUP
 		/* Write a log record about the deletion of the .ibd
 		file, so that mysqlbackup can replay it in the
@@ -3523,7 +3539,7 @@ skip_second_rename:
 	mutex_exit(&fil_system->mutex);
 
 #ifndef UNIV_HOTBACKUP
-	if (success && !recv_recovery_on) {
+	if (success && !recv_recovery_on && !IS_XTRABACKUP()) {
 		mtr_t		mtr;
 
 		mtr_start(&mtr);
@@ -3769,7 +3785,18 @@ fil_create_new_single_table_tablespace(
 	ibool		success;
 	/* TRUE if a table is created with CREATE TEMPORARY TABLE */
 	bool		is_temp = !!(flags2 & DICT_TF2_TEMPORARY);
-	bool		has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags) != 0;
+
+
+	/* For XtraBackup recovery we force remote tablespaces to be local,
+	i.e. never execute the code path corresponding to has_data_dir == true.
+	We don't create .isl files either, because we rely on innobackupex to
+	copy them under a global lock, and use them to copy remote tablespaces
+	to their proper locations on --copy-back.
+
+	See also MySQL bug #72022: dir_path is always NULL for remote
+	tablespaces when a MLOG_FILE_CREATE* log record is replayed (the remote
+	directory is not available from MLOG_FILE_CREATE*). */
+	bool		has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags) != 0 && !IS_XTRABACKUP();
 	ulint		atomic_writes = FSP_FLAGS_GET_ATOMIC_WRITES(flags);
 	fil_space_crypt_t *crypt_data = NULL;
 
@@ -3938,6 +3965,7 @@ fil_create_new_single_table_tablespace(
 	}
 
 #ifndef UNIV_HOTBACKUP
+	if (!IS_XTRABACKUP())
 	{
 		mtr_t		mtr;
 		ulint		mlog_file_flag = 0;
@@ -3977,6 +4005,138 @@ error_exit_3:
 
 	return(err);
 }
+
+#include "pars0pars.h"
+#include "que0que.h"
+#include "dict0priv.h"
+static
+void
+fil_remove_invalid_table_from_data_dict(const char *name)
+{
+	trx_t*		trx;
+	pars_info_t*	info = NULL;
+
+	trx = trx_allocate_for_mysql();
+	trx_start_for_ddl(trx, TRX_DICT_OP_TABLE);
+
+	ut_ad(mutex_own(&dict_sys->mutex));
+
+	trx->op_info = "removing invalid table from data dictionary";
+
+	info = pars_info_create();
+
+	pars_info_add_str_literal(info, "table_name", name);
+
+	que_eval_sql(info,
+		"PROCEDURE DROP_TABLE_PROC () IS\n"
+		"sys_foreign_id CHAR;\n"
+		"table_id CHAR;\n"
+		"index_id CHAR;\n"
+		"foreign_id CHAR;\n"
+		"found INT;\n"
+
+		"DECLARE CURSOR cur_fk IS\n"
+		"SELECT ID FROM SYS_FOREIGN\n"
+		"WHERE FOR_NAME = :table_name\n"
+		"AND TO_BINARY(FOR_NAME)\n"
+		"  = TO_BINARY(:table_name)\n"
+		"LOCK IN SHARE MODE;\n"
+
+		"DECLARE CURSOR cur_idx IS\n"
+		"SELECT ID FROM SYS_INDEXES\n"
+		"WHERE TABLE_ID = table_id\n"
+		"LOCK IN SHARE MODE;\n"
+
+		"BEGIN\n"
+		"SELECT ID INTO table_id\n"
+		"FROM SYS_TABLES\n"
+		"WHERE NAME = :table_name\n"
+		"LOCK IN SHARE MODE;\n"
+		"IF (SQL % NOTFOUND) THEN\n"
+		"       RETURN;\n"
+		"END IF;\n"
+		"found := 1;\n"
+		"SELECT ID INTO sys_foreign_id\n"
+		"FROM SYS_TABLES\n"
+		"WHERE NAME = 'SYS_FOREIGN'\n"
+		"LOCK IN SHARE MODE;\n"
+		"IF (SQL % NOTFOUND) THEN\n"
+		"       found := 0;\n"
+		"END IF;\n"
+		"IF (:table_name = 'SYS_FOREIGN') THEN\n"
+		"       found := 0;\n"
+		"END IF;\n"
+		"IF (:table_name = 'SYS_FOREIGN_COLS') THEN\n"
+		"       found := 0;\n"
+		"END IF;\n"
+		"OPEN cur_fk;\n"
+		"WHILE found = 1 LOOP\n"
+		"       FETCH cur_fk INTO foreign_id;\n"
+		"       IF (SQL % NOTFOUND) THEN\n"
+		"               found := 0;\n"
+		"       ELSE\n"
+		"               DELETE FROM SYS_FOREIGN_COLS\n"
+		"               WHERE ID = foreign_id;\n"
+		"               DELETE FROM SYS_FOREIGN\n"
+		"               WHERE ID = foreign_id;\n"
+		"       END IF;\n"
+		"END LOOP;\n"
+		"CLOSE cur_fk;\n"
+		"found := 1;\n"
+		"OPEN cur_idx;\n"
+		"WHILE found = 1 LOOP\n"
+		"       FETCH cur_idx INTO index_id;\n"
+		"       IF (SQL % NOTFOUND) THEN\n"
+		"               found := 0;\n"
+		"       ELSE\n"
+		"               DELETE FROM SYS_FIELDS\n"
+		"               WHERE INDEX_ID = index_id;\n"
+		"               DELETE FROM SYS_INDEXES\n"
+		"               WHERE ID = index_id\n"
+		"               AND TABLE_ID = table_id;\n"
+		"       END IF;\n"
+		"END LOOP;\n"
+		"CLOSE cur_idx;\n"
+		"DELETE FROM SYS_COLUMNS\n"
+		"WHERE TABLE_ID = table_id;\n"
+		"DELETE FROM SYS_TABLES\n"
+		"WHERE NAME = :table_name;\n"
+		"END;\n"
+		, FALSE, trx);
+
+	/* SYS_DATAFILES and SYS_TABLESPACES do not necessarily exist
+	on XtraBackup recovery. See comments around
+	dict_create_or_check_foreign_constraint_tables() in
+	innobase_start_or_create_for_mysql(). */
+	if (dict_table_get_low("SYS_DATAFILES") != NULL) {
+		info = pars_info_create();
+
+		pars_info_add_str_literal(info, "table_name", name);
+
+		que_eval_sql(info,
+			"PROCEDURE DROP_TABLE_PROC () IS\n"
+			"space_id INT;\n"
+
+			"BEGIN\n"
+			"SELECT SPACE INTO space_id\n"
+			"FROM SYS_TABLES\n"
+			"WHERE NAME = :table_name;\n"
+			"IF (SQL % NOTFOUND) THEN\n"
+			"       RETURN;\n"
+			"END IF;\n"
+			"DELETE FROM SYS_TABLESPACES\n"
+			"WHERE SPACE = space_id;\n"
+			"DELETE FROM SYS_DATAFILES\n"
+			"WHERE SPACE = space_id;\n"
+			"END;\n"
+			, FALSE, trx);
+	}
+
+	trx_commit_for_mysql(trx);
+
+	trx_free_for_mysql(trx);
+}
+
 
 #ifndef UNIV_HOTBACKUP
 /********************************************************************//**
@@ -4118,8 +4278,10 @@ fil_open_single_table_tablespace(
 	in the default location. If it is remote, it should not be here. */
 	def.filepath = fil_make_ibd_name(tablename, false);
 
-	/* The path_in was read from SYS_DATAFILES. */
-	if (path_in) {
+	/* The path_in was read from SYS_DATAFILES.
+	We skip SYS_DATAFILES validation and remote tablespaces discovery for
+	XtraBackup, as all tablespaces are local for XtraBackup recovery. */
+	if (path_in && !IS_XTRABACKUP()) {
 		if (strcmp(def.filepath, path_in)) {
 			dict.filepath = mem_strdup(path_in);
 			/* possibility of multiple files. */
@@ -4261,12 +4423,19 @@ fil_open_single_table_tablespace(
 		/* The following call prints an error message */
 		os_file_get_last_error(true);
 
-		ib_logf(IB_LOG_LEVEL_ERROR,
+		ib_logf(IS_XTRABACKUP() ? IB_LOG_LEVEL_WARN : IB_LOG_LEVEL_ERROR,
 			"Could not find a valid tablespace file for '%s'. "
 			"See " REFMAN "innodb-troubleshooting-datadict.html "
 			"for how to resolve the issue.",
 			tablename);
+		if (IS_XTRABACKUP() && fix_dict) {
+			ib_logf(IB_LOG_LEVEL_WARN,
+			"It will be removed from the data dictionary.");
 
+			if (purge_sys) {
+				fil_remove_invalid_table_from_data_dict(tablename);
+			}
+		}
 		err = DB_CORRUPTION;
 
 		goto cleanup_and_exit;
@@ -4691,6 +4860,11 @@ check_first_page:
 	}
 
 	if (!fsp->success) {
+		if (IS_XTRABACKUP()) {
+			/* Do not attempt restore from doublewrite buffer
+			  in Xtrabackup, this does not work.*/
+			return;
+		}
 		if (!restore_attempted) {
 			if (!fil_user_tablespace_find_space_id(fsp)) {
 				return;
@@ -4758,6 +4932,10 @@ fil_load_single_table_tablespace(
 	os_offset_t	size;
 	fil_space_t*	space;
 
+	fsp_open_info*	fsp;
+	ulong		minimum_size;
+	ibool		file_space_create_success;
+
 	memset(&def, 0, sizeof(def));
 	memset(&remote, 0, sizeof(remote));
 
@@ -4813,6 +4991,7 @@ fil_load_single_table_tablespace(
 # endif /* !UNIV_HOTBACKUP */
 #endif
 
+
 	/* Check for a link file which locates a remote tablespace. */
 	remote.success = fil_open_linked_file(
 		tablename, &remote.filepath, &remote.file, FALSE);
@@ -4823,6 +5002,17 @@ fil_load_single_table_tablespace(
 		if (!remote.success) {
 			os_file_close(remote.file);
 			mem_free(remote.filepath);
+
+			if (srv_backup_mode && (remote.id == ULINT_UNDEFINED
+				|| remote.id == 0)) {
+
+				/* Ignore files that have uninitialized space
+				IDs on the backup stage. This means that a
+				tablespace has just been created and we will
+				replay the corresponding log records on
+				prepare. */
+				goto func_exit_after_close;
+			}
 		}
 	}
 
@@ -4837,6 +5027,18 @@ fil_load_single_table_tablespace(
 		fil_validate_single_table_tablespace(tablename, &def);
 		if (!def.success) {
 			os_file_close(def.file);
+
+			if (IS_XTRABACKUP() && srv_backup_mode && (def.id == ULINT_UNDEFINED
+				|| def.id == 0)) {
+
+				/* Ignore files that have uninitialized space
+				IDs on the backup stage. This means that a
+				tablespace has just been created and we will
+				replay the corresponding log records on
+				prepare. */
+
+				goto func_exit_after_close;
+			}
 		}
 	}
 
@@ -4922,7 +5124,7 @@ will_not_choose:
 	/* At this point, only one tablespace is open */
 	ut_a(def.success == !remote.success);
 
-	fsp_open_info*	fsp = def.success ? &def : &remote;
+	fsp = def.success ? &def : &remote;
 
 	/* Get and test the file size. */
 	size = os_file_get_size(fsp->file);
@@ -4941,19 +5143,20 @@ will_not_choose:
 
 	/* Every .ibd file is created >= 4 pages in size. Smaller files
 	cannot be ok. */
-	ulong minimum_size = FIL_IBD_FILE_INITIAL_SIZE * UNIV_PAGE_SIZE;
+	minimum_size = FIL_IBD_FILE_INITIAL_SIZE * UNIV_PAGE_SIZE;
 	if (size < minimum_size) {
-#ifndef UNIV_HOTBACKUP
-		ib_logf(IB_LOG_LEVEL_ERROR,
-			"The size of single-table tablespace file %s "
-			"is only " UINT64PF ", should be at least %lu!",
-			fsp->filepath, size, minimum_size);
-		os_file_close(fsp->file);
-		goto no_good_file;
-#else
-		fsp->id = ULINT_UNDEFINED;
-		fsp->flags = 0;
-#endif /* !UNIV_HOTBACKUP */
+		if (!IS_XTRABACKUP())  {
+			ib_logf(IB_LOG_LEVEL_ERROR,
+				"The size of single-table tablespace file %s "
+				"is only " UINT64PF ", should be at least %lu!",
+				fsp->filepath, size, minimum_size);
+			os_file_close(fsp->file);
+			goto no_good_file;
+		}
+		else {
+			fsp->id = ULINT_UNDEFINED;
+			fsp->flags = 0;
+		}
 	}
 
 #ifdef UNIV_HOTBACKUP
@@ -5024,6 +5227,7 @@ will_not_choose:
 	}
 	mutex_exit(&fil_system->mutex);
 #endif /* UNIV_HOTBACKUP */
+
 	/* Adjust the memory-based flags that would normally be set by
 	dict_tf_to_fsp_flags(). In recovery, we have no data dictionary. */
 	if (FSP_FLAGS_HAS_PAGE_COMPRESSION(fsp->flags)) {
@@ -5034,7 +5238,7 @@ will_not_choose:
 	/* We will leave atomic_writes at ATOMIC_WRITES_DEFAULT.
 	That will be adjusted in fil_space_for_table_exists_in_mem(). */
 
-	ibool file_space_create_success = fil_space_create(
+	file_space_create_success = fil_space_create(
 		tablename, fsp->id, fsp->flags, FIL_TABLESPACE,
 		fsp->crypt_data, false);
 
@@ -5062,13 +5266,56 @@ will_not_choose:
 	}
 
 func_exit:
-	os_file_close(fsp->file);
+	/* We reuse file handles on the backup stage in XtraBackup to avoid
+	inconsistencies between the file name and the actual tablespace contents
+	if a DDL occurs between a fil_load_single_table_tablespaces() call and
+	the actual copy operation. */
+	if (IS_XTRABACKUP() && srv_backup_mode && !srv_close_files) {
 
-#ifdef UNIV_HOTBACKUP
+		fil_node_t*	node;
+		fil_space_t*	space;
+
+		mutex_enter(&fil_system->mutex);
+
+		space = fil_space_get_by_id(fsp->id);
+
+		if (space) {
+			node = UT_LIST_GET_LAST(space->chain);
+
+			/* The handle will be closed by xtrabackup in
+			xtrabackup_copy_datafile(). We set node->open to TRUE to
+			make sure no one calls fil_node_open_file()
+			(i.e. attempts to reopen the tablespace by name) during
+			the backup stage. */
+
+			node->open = TRUE;
+			node->handle = fsp->file;
+
+			/* The following is copied from fil_node_open_file() to
+			pass fil_system validaty checks. We cannot use
+			fil_node_open_file() directly, as that would re-open the
+			file by name and create another file handle. */
+
+			fil_system->n_open++;
+			fil_n_file_opened++;
+
+			if (fil_space_belongs_in_lru(space)) {
+
+				/* Put the node to the LRU list */
+				UT_LIST_ADD_FIRST(LRU, fil_system->LRU, node);
+			}
+		}
+
+		mutex_exit(&fil_system->mutex);
+	}
+	else {
+		os_file_close(fsp->file);
+	}
+
+
 func_exit_after_close:
-#else
 	ut_ad(!mutex_own(&fil_system->mutex));
-#endif
+
 	mem_free(tablename);
 	if (remote.success) {
 		mem_free(remote.filepath);
@@ -5082,7 +5329,7 @@ directory. We retry 100 times if os_file_readdir_next_file() returns -1. The
 idea is to read as much good data as we can and jump over bad data.
 @return 0 if ok, -1 if error even after the retries, 1 if at the end
 of the directory */
-static
+
 int
 fil_file_readdir_next_file(
 /*=======================*/
@@ -5123,7 +5370,7 @@ space id is != 0.
 @return	DB_SUCCESS or error number */
 UNIV_INTERN
 dberr_t
-fil_load_single_table_tablespaces(void)
+fil_load_single_table_tablespaces(ibool (*pred)(const char*, const char*))
 /*===================================*/
 {
 	int		ret;
@@ -5198,14 +5445,20 @@ fil_load_single_table_tablespaces(void)
 					goto next_file_item;
 				}
 
-				/* We found a symlink or a file */
+				/* We found a symlink or a file
+
+				Ignore .isl files on XtraBackup
+				recovery, all tablespaces must be local. */
 				if (strlen(fileinfo.name) > 4
 				    && (0 == strcmp(fileinfo.name
 						   + strlen(fileinfo.name) - 4,
 						   ".ibd")
-					|| 0 == strcmp(fileinfo.name
-						   + strlen(fileinfo.name) - 4,
-						   ".isl"))) {
+					|| ((!IS_XTRABACKUP() || srv_backup_mode) 
+							&& 0 == strcmp(fileinfo.name
+							 + strlen(fileinfo.name) - 4,
+							".isl")))
+					 && (!pred ||
+						pred(dbinfo.name, fileinfo.name))) {
 					/* The name ends in .ibd or .isl;
 					try opening the file */
 					fil_load_single_table_tablespace(
@@ -5361,6 +5614,9 @@ fil_space_for_table_exists_in_mem(
 					information to the .err log if a
 					matching tablespace is not found from
 					memory */
+	bool		remove_from_data_dict_if_does_not_exist,
+					/*!< in: remove from the data dictionary
+					if tablespace does not exist */
 	bool		adjust_space,	/*!< in: whether to adjust space id
 					when find table space mismatch */
 	mem_heap_t*	heap,		/*!< in: heap memory */
@@ -5431,6 +5687,11 @@ fil_space_for_table_exists_in_mem(
 		if (fnamespace == NULL) {
 			if (print_error_if_does_not_exist) {
 				fil_report_missing_tablespace(name, id);
+				if (IS_XTRABACKUP()) {
+					ib_logf(IB_LOG_LEVEL_WARN,
+						"It will be removed from "
+						"the data dictionary.");
+				}
 			}
 		} else {
 			ut_print_timestamp(stderr);
@@ -6045,6 +6306,16 @@ _fil_io(
 
 	ut_ad(mode != OS_AIO_IBUF || space->purpose == FIL_TABLESPACE);
 
+	if (IS_XTRABACKUP() && space->size > 0 && space->size <= block_offset) {
+		ulint	actual_size;
+
+		mutex_exit(&fil_system->mutex);
+		fil_extend_space_to_desired_size(&actual_size, space->id,
+			block_offset + 1);
+		mutex_enter(&fil_system->mutex);
+		/* should retry? but it may safe for xtrabackup for now. */
+	}
+
 	node = fil_space_get_node(space, space_id, &block_offset, byte_offset, len);
 
 	if (!node) {
@@ -6085,8 +6356,8 @@ _fil_io(
 
 	/* Check that at least the start offset is within the bounds of a
 	single-table tablespace, including rollback tablespaces. */
-	if (UNIV_UNLIKELY(node->size <= block_offset)
-	    && space->id != 0 && space->purpose == FIL_TABLESPACE) {
+	if (!IS_XTRABACKUP() && UNIV_UNLIKELY(node->size <= block_offset)
+			&& space->id != 0 && space->purpose == FIL_TABLESPACE) {
 
 		fil_report_invalid_page_access(
 			block_offset, space_id, space->name, byte_offset,
@@ -6104,9 +6375,9 @@ _fil_io(
 		offset = ((os_offset_t) block_offset << UNIV_PAGE_SIZE_SHIFT)
 			+ byte_offset;
 
-		ut_a(node->size - block_offset
+		ut_a(IS_XTRABACKUP() || (node->size - block_offset
 		     >= ((byte_offset + len + (UNIV_PAGE_SIZE - 1))
-			 / UNIV_PAGE_SIZE));
+			 / UNIV_PAGE_SIZE)));
 	} else {
 		ulint	zip_size_shift;
 		switch (zip_size) {
@@ -6121,8 +6392,8 @@ _fil_io(
 		}
 		offset = ((os_offset_t) block_offset << zip_size_shift)
 			+ byte_offset;
-		ut_a(node->size - block_offset
-		     >= (len + (zip_size - 1)) / zip_size);
+		ut_a(IS_XTRABACKUP() || (node->size - block_offset
+		     >= (len + (zip_size - 1)) / zip_size));
 	}
 
 	/* Do aio */
@@ -7416,7 +7687,7 @@ fil_space_get_crypt_data(
 
 		crypt_data = space->crypt_data;
 
-		if (!space->page_0_crypt_read) {
+		if (!space->page_0_crypt_read && !IS_XTRABACKUP()) {
 			ib_logf(IB_LOG_LEVEL_WARN,
 				"Space %lu name %s contains encryption %d information for key_id %u but page0 is not read.",
 				space->id,

@@ -783,13 +783,19 @@ buf_page_is_corrupted(
 	if (checksum_field1 == 0 && checksum_field2 == 0
 	    && *reinterpret_cast<const ib_uint64_t*>(read_buf +
 						     FIL_PAGE_LSN) == 0) {
-		/* make sure that the page is really empty */
-		for (ulint i = 0; i < UNIV_PAGE_SIZE; i++) {
-			if (read_buf[i] != 0) {
-				ib_logf(IB_LOG_LEVEL_INFO,
+		/* make sure that the page is really empty .
+			But in Xtrabackup, skip this check.
+			is incompatible with 1st newly-created tablespace pages, which
+			have FIL_PAGE_FIL_FLUSH_LSN != 0, FIL_PAGE_OR_CHKSUM == 0,
+			FIL_PAGE_END_LSN_OLD_CHKSUM == 0 */
+		if (!IS_XTRABACKUP()) {
+			for (ulint i = 0; i < UNIV_PAGE_SIZE; i++) {
+				if (read_buf[i] != 0) {
+					ib_logf(IB_LOG_LEVEL_INFO,
 					"Checksum fields zero but page is not empty.");
 
-				return(true);
+					return(true);
+				}
 			}
 		}
 
