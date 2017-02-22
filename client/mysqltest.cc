@@ -3373,6 +3373,12 @@ void do_exec(struct st_command *command)
 #endif
 #endif
 
+  if (disable_result_log)
+  {
+    /* Collect stderr output as well, for the case app. crashes or returns error.*/
+    dynstr_append(&ds_cmd, " 2>&1");
+  }
+
   DBUG_PRINT("info", ("Executing '%s' as '%s'",
                       command->first_argument, ds_cmd.str));
 
@@ -3408,16 +3414,7 @@ void do_exec(struct st_command *command)
       len--;
     }
 #endif
-    if (disable_result_log)
-    {
-      if (len)
-        buf[len-1] = 0;
-      DBUG_PRINT("exec_result",("%s", buf));
-    }
-    else
-    {
-      replace_dynstr_append_mem(ds_result, buf, len);
-    }
+    replace_dynstr_append_mem(ds_result, buf, len);
   }
   error= pclose(res_file);
 
@@ -3427,7 +3424,7 @@ void do_exec(struct st_command *command)
     dynstr_free(&ds_sorted);
   }
 
-  if (error > 0)
+  if (error)
   {
     uint status= WEXITSTATUS(error);
     int i;
@@ -3473,6 +3470,12 @@ void do_exec(struct st_command *command)
   }
 
   dynstr_free(&ds_cmd);
+
+  if (disable_result_log)
+  {
+    /* Disable output in case of successful exit.*/
+    dynstr_set(&ds_res,"");
+  }
   DBUG_VOID_RETURN;
 }
 
@@ -3938,6 +3941,47 @@ void do_mkdir(struct st_command *command)
   DBUG_VOID_RETURN;
 }
 
+
+/*
+   Remove directory recursively.
+*/
+static int rmtree(const char *dir)
+{
+  char path[FN_REFLEN];
+  char sep[]={ FN_LIBCHAR, 0 };
+  int err=0;
+
+  MY_DIR *dir_info= my_dir(dir, MYF(MY_DONT_SORT | MY_WANT_STAT));
+  if (!dir_info)
+    return 1;
+
+  for (uint i= 0; i < dir_info->number_of_files; i++)
+  {
+    FILEINFO *file= dir_info->dir_entry + i;
+    /* Skip "." and ".." */
+    if (!strcmp(file->name, ".") || !strcmp(file->name, ".."))
+      continue;
+
+    strxnmov(path, sizeof(path), dir, sep, file->name, NULL);
+
+    if (!MY_S_ISDIR(file->mystat->st_mode))
+      err= my_delete(path, 0);
+    else
+      err= rmtree(path);
+
+    if(err)
+      break;
+  }
+
+  my_dirend(dir_info);
+
+  if (!err)
+   err= rmdir(dir);
+
+  return err;
+}
+
+
 /*
   SYNOPSIS
   do_rmdir
@@ -3945,12 +3989,11 @@ void do_mkdir(struct st_command *command)
 
   DESCRIPTION
   rmdir <dir_name>
-  Remove the empty directory <dir_name>
+  Remove the directory tree
 */
 
 void do_rmdir(struct st_command *command)
 {
-  int error;
   static DYNAMIC_STRING ds_dirname;
   const struct command_arg rmdir_args[] = {
     { "dirname", ARG_STRING, TRUE, &ds_dirname, "Directory to remove" }
@@ -3961,9 +4004,25 @@ void do_rmdir(struct st_command *command)
                      rmdir_args, sizeof(rmdir_args)/sizeof(struct command_arg),
                      ' ');
 
-  DBUG_PRINT("info", ("removing directory: %s", ds_dirname.str));
-  error= rmdir(ds_dirname.str) != 0;
-  handle_command_error(command, error, errno);
+  char *vardir= getenv("MYSQLTEST_VARDIR");
+  char *dir= ds_dirname.str;
+  size_t vardir_len= strlen(vardir);
+  size_t dir_len= strlen(dir);
+
+  if (!vardir || !vardir_len || dir_len <= vardir_len
+    || memcmp(dir, vardir, vardir_len - 1)
+    || dir[vardir_len] != '/')
+  {
+    report_or_die("rmdir: directory '%s' is not a subdirectory "
+      " of MYSQLTEST_VARDIR '%s'", dir, vardir);
+  }
+  else
+  {
+    DBUG_PRINT("info", ("removing directory: %s", dir));
+    if (rmtree(dir))
+      handle_command_error(command, 1, errno);
+  }
+
   dynstr_free(&ds_dirname);
   DBUG_VOID_RETURN;
 }
@@ -4127,7 +4186,8 @@ void read_until_delimiter(DYNAMIC_STRING *ds,
   while (1)
   {
     c= my_getc(cur_file->file);
-
+    if (c == '\r')
+      c= my_getc(cur_file->file);
     if (c == '\n')
     {
       cur_file->lineno++;
