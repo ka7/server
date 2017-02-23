@@ -63,8 +63,6 @@ extern lsn_t checkpoint_lsn_start;
 
 extern xb_page_bitmap *changed_page_bitmap;
 
-extern ulint	xtrabackup_rebuild_threads;
-
 extern my_option	xb_long_options[];
 extern uint		xb_long_options_count;
 
@@ -83,7 +81,6 @@ extern char		*xtrabackup_tables_file;
 extern char		*xtrabackup_databases;
 extern char		*xtrabackup_databases_file;
 
-extern my_bool		xtrabackup_compact;
 extern ibool		xtrabackup_compress;
 extern ibool		xtrabackup_encrypt;
 
@@ -109,8 +106,14 @@ extern int		xtrabackup_parallel;
 
 extern my_bool		xb_close_files;
 extern const char	*xtrabackup_compress_alg;
-extern uint		xtrabackup_compress_threads;
-extern ulonglong	xtrabackup_compress_chunk_size;
+#ifdef __cplusplus
+extern "C"{
+#endif
+  extern uint		xtrabackup_compress_threads;
+  extern ulonglong	xtrabackup_compress_chunk_size;
+#ifdef __cplusplus
+}
+#endif
 extern ulong		xtrabackup_encrypt_algo;
 extern uint		xtrabackup_encrypt_threads;
 extern ulonglong	xtrabackup_encrypt_chunk_size;
@@ -119,7 +122,6 @@ extern char		*xtrabackup_incremental_basedir;
 extern char		*xtrabackup_extra_lsndir;
 extern char		*xtrabackup_incremental_dir;
 extern ulint		xtrabackup_log_copy_interval;
-extern my_bool		xtrabackup_rebuild_indexes;
 extern char		*xtrabackup_stream_str;
 extern long		xtrabackup_throttle;
 extern longlong		xtrabackup_use_memory;
@@ -167,14 +169,6 @@ extern uint		opt_safe_slave_backup_timeout;
 extern const char	*opt_history;
 extern my_bool		opt_decrypt;
 
-#if defined(HAVE_OPENSSL)
-extern my_bool opt_use_ssl;
-extern my_bool opt_ssl_verify_server_cert;
-#if !defined(HAVE_YASSL)
-extern char *opt_server_public_key;
-#endif
-#endif
-
 enum binlog_info_enum { BINLOG_INFO_OFF, BINLOG_INFO_LOCKLESS, BINLOG_INFO_ON,
 			BINLOG_INFO_AUTO};
 
@@ -218,6 +212,14 @@ Check if parameter is set in defaults file or via command line argument
 @return true if parameter is set. */
 bool
 check_if_param_set(const char *param);
+
+#if defined(HAVE_OPENSSL)
+extern my_bool opt_use_ssl;
+extern my_bool opt_ssl_verify_server_cert;
+#if !defined(HAVE_YASSL)
+extern char *opt_server_public_key;
+#endif
+#endif
 
 
 void
