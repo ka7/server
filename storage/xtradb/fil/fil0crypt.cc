@@ -995,6 +995,7 @@ fil_space_verify_crypt_checksum(
 		return (true);
 	}
 
+
 	/* Compressed pages use different checksum method. We first store
 	the post encryption checksum on checksum location and after function
 	restore the original. */
@@ -1026,6 +1027,7 @@ fil_space_verify_crypt_checksum(
 	the field might have been uninitialized until MySQL 5.5. In MySQL 5.7
 	(and MariaDB Server 10.2.2) WL#7990 stopped writing the field for other
 	than page 0 of the system tablespace.
+
 
 	Starting from MariaDB 10.1 the field has been repurposed for
 	encryption key_version.

@@ -158,7 +158,7 @@ END {
 
 sub env_or_val($$) { defined $ENV{$_[0]} ? $ENV{$_[0]} : $_[1] }
 
-my $path_config_file;           # The generated config file, var/my.cnf
+our $path_config_file;           # The generated config file, var/my.cnf
 
 # Visual Studio produces executables in different sub-directories based on the
 # configuration used to build them.  To make life easier, an environment
@@ -194,6 +194,7 @@ my @DEFAULT_SUITES= qw(
     unit-
     vcol-
     wsrep-
+    mariabackup-
   );
 my $opt_suites;
 
@@ -201,6 +202,7 @@ our $opt_verbose= 0;  # Verbose output, enable with --verbose
 our $exe_patch;
 our $exe_mysql;
 our $exe_mysql_plugin;
+our $exe_xbstream;
 our $exe_mysqladmin;
 our $exe_mysqltest;
 our $exe_libtool;
@@ -1975,7 +1977,6 @@ sub executable_setup () {
   $exe_mysqladmin=     mtr_exe_exists("$path_client_bindir/mysqladmin");
   $exe_mysql=          mtr_exe_exists("$path_client_bindir/mysql");
   $exe_mysql_plugin=   mtr_exe_exists("$path_client_bindir/mysql_plugin");
-
   $exe_mysql_embedded= mtr_exe_maybe_exists("$basedir/libmysqld/examples/mysql_embedded");
 
   # Look for mysqltest executable
@@ -2302,6 +2303,7 @@ sub environment_setup {
   $ENV{'MYSQL_UPGRADE'}=            client_arguments("mysql_upgrade");
   $ENV{'MYSQLADMIN'}=               client_arguments("mysqladmin");
   $ENV{'MYSQL_CLIENT_TEST'}=        mysql_client_test_arguments();
+
   $ENV{'EXE_MYSQL'}=                $exe_mysql;
   $ENV{'MYSQL_PLUGIN'}=             $exe_mysql_plugin;
   $ENV{'MYSQL_EMBEDDED'}=           $exe_mysql_embedded;
