@@ -1,0 +1,15 @@
+language: cpp
+
+# Ubuntu 14.04 Trusty support
+sudo: required
+dist: trusty
+
+compiler:
+ - gcc
+
+script:
+ - BUILD/autorun.sh
+ - ./configure
+ - make
+ - make test
+ - #sudo make install
